@@ -332,16 +332,12 @@ static void fsl_espi_do_trans(struct spi_message *m,
 static void fsl_espi_cmd_trans(struct spi_message *m,
 				struct fsl_espi_transfer *trans, u8 *rx_buff)
 {
+	struct spi_device *spi = m->spi;
+	struct mpc8xxx_spi *mspi = spi_master_get_devdata(spi->master);
 	struct spi_transfer *t;
-	u8 *local_buf;
+	u8 *local_buf = mspi->local_buf;
 	int i = 0;
 	struct fsl_espi_transfer *espi_trans = trans;
-
-	local_buf = kzalloc(SPCOM_TRANLEN_MAX, GFP_KERNEL);
-	if (!local_buf) {
-		espi_trans->status = -ENOMEM;
-		return;
-	}
 
 	list_for_each_entry(t, &m->transfers, transfer_list) {
 		if (t->tx_buf) {
@@ -355,16 +351,17 @@ static void fsl_espi_cmd_trans(struct spi_message *m,
 	fsl_espi_do_trans(m, espi_trans);
 
 	espi_trans->actual_length = espi_trans->len;
-	kfree(local_buf);
 }
 
 static void fsl_espi_rw_trans(struct spi_message *m,
 				struct fsl_espi_transfer *trans, u8 *rx_buff)
 {
+	struct spi_device *spi = m->spi;
+	struct mpc8xxx_spi *mspi = spi_master_get_devdata(spi->master);
 	struct fsl_espi_transfer *espi_trans = trans;
 	unsigned int total_len = espi_trans->len;
 	struct spi_transfer *t;
-	u8 *local_buf;
+	u8 *local_buf = mspi->local_buf;
 	u8 *rx_buf = rx_buff;
 	unsigned int trans_len;
 	unsigned int addr;
@@ -372,12 +369,6 @@ static void fsl_espi_rw_trans(struct spi_message *m,
 	unsigned int rx_pos = 0;
 	unsigned int pos;
 	int i, loop;
-
-	local_buf = kzalloc(SPCOM_TRANLEN_MAX, GFP_KERNEL);
-	if (!local_buf) {
-		espi_trans->status = -ENOMEM;
-		return;
-	}
 
 	for (pos = 0, loop = 0; pos < total_len; pos += trans_len, loop++) {
 		trans_len = total_len - pos;
@@ -424,8 +415,6 @@ static void fsl_espi_rw_trans(struct spi_message *m,
 		else
 			espi_trans->actual_length += espi_trans->len;
 	}
-
-	kfree(local_buf);
 }
 
 static int fsl_espi_do_one_msg(struct spi_master *master,
@@ -672,6 +661,12 @@ static struct spi_master * fsl_espi_probe(struct device *dev,
 	master->auto_runtime_pm = true;
 
 	mpc8xxx_spi = spi_master_get_devdata(master);
+
+	mpc8xxx_spi->local_buf = devm_kzalloc(dev, SPCOM_TRANLEN_MAX, GFP_KERNEL);
+	if (!mpc8xxx_spi->local_buf) {
+		ret = -ENOMEM;
+		goto err_probe;
+	}
 
 	mpc8xxx_spi->reg_base = devm_ioremap_resource(dev, mem);
 	if (IS_ERR(mpc8xxx_spi->reg_base)) {
