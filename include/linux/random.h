@@ -22,6 +22,10 @@ extern void add_input_randomness(unsigned int type, unsigned int code,
 				 unsigned int value);
 extern void add_interrupt_randomness(int irq, int irq_flags);
 
+extern void random_input_words(__u32 *buf, size_t wordcount, int ent_count);
+extern int random_input_wait(void);
+#define HAS_RANDOM_INPUT_WAIT 1
+
 extern void get_random_bytes(void *buf, int nbytes);
 extern int add_random_ready_callback(struct random_ready_callback *rdy);
 extern void del_random_ready_callback(struct random_ready_callback *rdy);

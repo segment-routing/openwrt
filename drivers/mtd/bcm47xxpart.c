@@ -38,6 +38,7 @@
 #define NVRAM_HEADER			0x48534C46	/* FLSH */
 #define POT_MAGIC1			0x54544f50	/* POTT */
 #define POT_MAGIC2			0x504f		/* OP */
+#define T_METER_MAGIC			0x4D540000	/* MT */
 #define ML_MAGIC1			0x39685a42
 #define ML_MAGIC2			0x26594131
 #define TRX_MAGIC			0x30524448
@@ -61,16 +62,46 @@ static void bcm47xxpart_add_part(struct mtd_partition *part, const char *name,
 	part->mask_flags = mask_flags;
 }
 
+/*
+ * Calculate real end offset (address) for a given amount of data. It checks
+ * all blocks skipping bad ones.
+ */
+static size_t bcm47xxpart_real_offset(struct mtd_info *master, size_t offset,
+				      size_t bytes)
+{
+	size_t real_offset = offset;
+
+	if (mtd_block_isbad(master, real_offset))
+		pr_warn("Base offset shouldn't be at bad block");
+
+	while (bytes >= master->erasesize) {
+		bytes -= master->erasesize;
+		real_offset += master->erasesize;
+		while (mtd_block_isbad(master, real_offset)) {
+			real_offset += master->erasesize;
+
+			if (real_offset >= master->size)
+				return real_offset - master->erasesize;
+		}
+	}
+
+	real_offset += bytes;
+
+	return real_offset;
+}
+
 static const char *bcm47xxpart_trx_data_part_name(struct mtd_info *master,
 						  size_t offset)
 {
 	uint32_t buf;
 	size_t bytes_read;
+	int err;
 
-	if (mtd_read(master, offset, sizeof(buf), &bytes_read,
-		     (uint8_t *)&buf) < 0) {
-		pr_err("mtd_read error while parsing (offset: 0x%X)!\n",
-			offset);
+	err  = mtd_read(master, offset, sizeof(buf), &bytes_read,
+			(uint8_t *)&buf);
+	if (err && !mtd_is_bitflip(err)) {
+		pr_err("mtd_read error while parsing (offset: 0x%X): %d\n",
+			offset, err);
 		goto out_default;
 	}
 
@@ -95,6 +126,7 @@ static int bcm47xxpart_parse(struct mtd_info *master,
 	int trx_part = -1;
 	int last_trx_part = -1;
 	int possible_nvram_sizes[] = { 0x8000, 0xF000, 0x10000, };
+	int err;
 
 	/*
 	 * Some really old flashes (like AT45DB*) had smaller erasesize-s, but
@@ -118,8 +150,8 @@ static int bcm47xxpart_parse(struct mtd_info *master,
 	/* Parse block by block looking for magics */
 	for (offset = 0; offset <= master->size - blocksize;
 	     offset += blocksize) {
-		/* Nothing more in higher memory */
-		if (offset >= 0x2000000)
+		/* Nothing more in higher memory on BCM47XX (MIPS) */
+		if (config_enabled(CONFIG_BCM47XX) && offset >= 0x2000000)
 			break;
 
 		if (curr_part >= BCM47XXPART_MAX_PARTS) {
@@ -128,10 +160,11 @@ static int bcm47xxpart_parse(struct mtd_info *master,
 		}
 
 		/* Read beginning of the block */
-		if (mtd_read(master, offset, BCM47XXPART_BYTES_TO_READ,
-			     &bytes_read, (uint8_t *)buf) < 0) {
-			pr_err("mtd_read error while parsing (offset: 0x%X)!\n",
-			       offset);
+		err = mtd_read(master, offset, BCM47XXPART_BYTES_TO_READ,
+			       &bytes_read, (uint8_t *)buf);
+		if (err && !mtd_is_bitflip(err)) {
+			pr_err("mtd_read error while parsing (offset: 0x%X): %d\n",
+			       offset, err);
 			continue;
 		}
 
@@ -176,8 +209,19 @@ static int bcm47xxpart_parse(struct mtd_info *master,
 			continue;
 		}
 
+		/* T_Meter */
+		if ((le32_to_cpu(buf[0x000 / 4]) & 0xFFFF0000) == T_METER_MAGIC &&
+		    (le32_to_cpu(buf[0x030 / 4]) & 0xFFFF0000) == T_METER_MAGIC &&
+		    (le32_to_cpu(buf[0x060 / 4]) & 0xFFFF0000) == T_METER_MAGIC) {
+			bcm47xxpart_add_part(&parts[curr_part++], "T_Meter", offset,
+					     MTD_WRITEABLE);
+			continue;
+		}
+
 		/* TRX */
 		if (buf[0x000 / 4] == TRX_MAGIC) {
+			uint32_t tmp;
+
 			if (BCM47XXPART_MAX_PARTS - curr_part < 4) {
 				pr_warn("Not enough partitions left to register trx, scanning stopped!\n");
 				break;
@@ -192,18 +236,18 @@ static int bcm47xxpart_parse(struct mtd_info *master,
 			i = 0;
 			/* We have LZMA loader if offset[2] points to sth */
 			if (trx->offset[2]) {
+				tmp = bcm47xxpart_real_offset(master, offset,
+							      trx->offset[i]);
 				bcm47xxpart_add_part(&parts[curr_part++],
-						     "loader",
-						     offset + trx->offset[i],
-						     0);
+						     "loader", tmp, 0);
 				i++;
 			}
 
 			if (trx->offset[i]) {
+				tmp = bcm47xxpart_real_offset(master, offset,
+							      trx->offset[i]);
 				bcm47xxpart_add_part(&parts[curr_part++],
-						     "linux",
-						     offset + trx->offset[i],
-						     0);
+						     "linux", tmp, 0);
 				i++;
 			}
 
@@ -215,11 +259,11 @@ static int bcm47xxpart_parse(struct mtd_info *master,
 			if (trx->offset[i]) {
 				const char *name;
 
-				name = bcm47xxpart_trx_data_part_name(master, offset + trx->offset[i]);
+				tmp = bcm47xxpart_real_offset(master, offset,
+							      trx->offset[i]);
+				name = bcm47xxpart_trx_data_part_name(master, tmp);
 				bcm47xxpart_add_part(&parts[curr_part++],
-						     name,
-						     offset + trx->offset[i],
-						     0);
+						     name, tmp, 0);
 				i++;
 			}
 
@@ -254,10 +298,11 @@ static int bcm47xxpart_parse(struct mtd_info *master,
 		}
 
 		/* Read middle of the block */
-		if (mtd_read(master, offset + 0x8000, 0x4,
-			     &bytes_read, (uint8_t *)buf) < 0) {
-			pr_err("mtd_read error while parsing (offset: 0x%X)!\n",
-			       offset);
+		err = mtd_read(master, offset + 0x8000, 0x4, &bytes_read,
+			       (uint8_t *)buf);
+		if (err && !mtd_is_bitflip(err)) {
+			pr_err("mtd_read error while parsing (offset: 0x%X): %d\n",
+			       offset, err);
 			continue;
 		}
 
@@ -277,10 +322,11 @@ static int bcm47xxpart_parse(struct mtd_info *master,
 		}
 
 		offset = master->size - possible_nvram_sizes[i];
-		if (mtd_read(master, offset, 0x4, &bytes_read,
-			     (uint8_t *)buf) < 0) {
-			pr_err("mtd_read error while reading at offset 0x%X!\n",
-			       offset);
+		err = mtd_read(master, offset, 0x4, &bytes_read,
+			       (uint8_t *)buf);
+		if (err && !mtd_is_bitflip(err)) {
+			pr_err("mtd_read error while reading (offset 0x%X): %d\n",
+			       offset, err);
 			continue;
 		}
 

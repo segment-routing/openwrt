@@ -152,7 +152,7 @@ int br_handle_frame_finish(struct net *net, struct sock *sk, struct sk_buff *skb
 	    br_multicast_rcv(br, p, skb, vid))
 		goto drop;
 
-	if (p->state == BR_STATE_LEARNING)
+	if ((p->state == BR_STATE_LEARNING) && skb->protocol != htons(ETH_P_PAE))
 		goto drop;
 
 	BR_INPUT_SKB_CB(skb)->brdev = br->dev;
@@ -168,7 +168,11 @@ int br_handle_frame_finish(struct net *net, struct sock *sk, struct sk_buff *skb
 	if (IS_ENABLED(CONFIG_INET) && skb->protocol == htons(ETH_P_ARP))
 		br_do_proxy_arp(skb, br, vid, p);
 
-	if (is_broadcast_ether_addr(dest)) {
+	if (skb->protocol == htons(ETH_P_PAE)) {
+		skb2 = skb;
+		/* Do not forward 802.1x/EAP frames */
+		skb = NULL;
+	} else if (is_broadcast_ether_addr(dest)) {
 		skb2 = skb;
 		unicast = false;
 	} else if (is_multicast_ether_addr(dest)) {
@@ -187,8 +191,8 @@ int br_handle_frame_finish(struct net *net, struct sock *sk, struct sk_buff *skb
 
 		unicast = false;
 		br->dev->stats.multicast++;
-	} else if ((dst = __br_fdb_get(br, dest, vid)) &&
-			dst->is_local) {
+	} else if ((p->flags & BR_ISOLATE_MODE) ||
+		   ((dst = __br_fdb_get(br, dest, vid)) && dst->is_local)) {
 		skb2 = skb;
 		/* Do not forward the packet since it's local. */
 		skb = NULL;
@@ -217,11 +221,13 @@ EXPORT_SYMBOL_GPL(br_handle_frame_finish);
 static int br_handle_local_finish(struct net *net, struct sock *sk, struct sk_buff *skb)
 {
 	struct net_bridge_port *p = br_port_get_rcu(skb->dev);
-	u16 vid = 0;
+	if (p->state != BR_STATE_DISABLED) {
+		u16 vid = 0;
 
-	/* check if vlan is allowed, to avoid spoofing */
-	if (p->flags & BR_LEARNING && br_should_learn(p, skb, &vid))
-		br_fdb_update(p->br, p, eth_hdr(skb)->h_source, vid, false);
+		/* check if vlan is allowed, to avoid spoofing */
+		if (p->flags & BR_LEARNING && br_should_learn(p, skb, &vid))
+			br_fdb_update(p->br, p, eth_hdr(skb)->h_source, vid, false);
+	}
 	return 0;	 /* process further */
 }
 
@@ -296,6 +302,18 @@ rx_handler_result_t br_handle_frame(struct sk_buff **pskb)
 
 forward:
 	switch (p->state) {
+	case BR_STATE_DISABLED:
+		if (ether_addr_equal(p->br->dev->dev_addr, dest))
+			skb->pkt_type = PACKET_HOST;
+
+		if (NF_HOOK(NFPROTO_BRIDGE, NF_BR_PRE_ROUTING, dev_net(skb->dev), NULL, skb, skb->dev, NULL,
+			br_handle_local_finish))
+			break;
+
+		BR_INPUT_SKB_CB(skb)->brdev = p->br->dev;
+		br_pass_frame_up(skb);
+		break;
+
 	case BR_STATE_FORWARDING:
 		rhook = rcu_dereference(br_should_route_hook);
 		if (rhook) {

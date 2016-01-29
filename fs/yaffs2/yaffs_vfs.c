@@ -283,7 +283,7 @@ static int yaffs_readpage_nolock(struct file *f, struct page *pg)
 		(long long)pos,
 		(unsigned)PAGE_CACHE_SIZE);
 
-	obj = yaffs_dentry_to_obj(f->f_dentry);
+	obj = yaffs_dentry_to_obj(f->f_path.dentry);
 
 	dev = obj->my_dev;
 
@@ -481,7 +481,7 @@ static ssize_t yaffs_hold_space(struct file *f)
 
 	int n_free_chunks;
 
-	obj = yaffs_dentry_to_obj(f->f_dentry);
+	obj = yaffs_dentry_to_obj(f->f_path.dentry);
 
 	dev = obj->my_dev;
 
@@ -499,7 +499,7 @@ static void yaffs_release_space(struct file *f)
 	struct yaffs_obj *obj;
 	struct yaffs_dev *dev;
 
-	obj = yaffs_dentry_to_obj(f->f_dentry);
+	obj = yaffs_dentry_to_obj(f->f_path.dentry);
 
 	dev = obj->my_dev;
 
@@ -591,7 +591,7 @@ static ssize_t yaffs_file_write(struct file *f, const char *buf, size_t n,
 	struct inode *inode;
 	struct yaffs_dev *dev;
 
-	obj = yaffs_dentry_to_obj(f->f_dentry);
+	obj = yaffs_dentry_to_obj(f->f_path.dentry);
 
 	if (!obj) {
 		yaffs_trace(YAFFS_TRACE_OS,
@@ -603,7 +603,7 @@ static ssize_t yaffs_file_write(struct file *f, const char *buf, size_t n,
 
 	yaffs_gross_lock(dev);
 
-	inode = f->f_dentry->d_inode;
+	inode = f->f_path.dentry->d_inode;
 
 	if (!S_ISBLK(inode->i_mode) && f->f_flags & O_APPEND)
 		ipos = inode->i_size;
@@ -727,7 +727,7 @@ static int yaffs_file_flush(struct file *file, fl_owner_t id)
 static int yaffs_file_flush(struct file *file)
 #endif
 {
-	struct yaffs_obj *obj = yaffs_dentry_to_obj(file->f_dentry);
+	struct yaffs_obj *obj = yaffs_dentry_to_obj(file->f_path.dentry);
 
 	struct yaffs_dev *dev = obj->my_dev;
 
@@ -774,7 +774,25 @@ static int yaffs_sync_object(struct file *file, struct dentry *dentry,
 }
 
 
-#if (LINUX_VERSION_CODE > KERNEL_VERSION(2, 6, 22))
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 16, 0))
+static const struct file_operations yaffs_file_operations = {
+#if (LINUX_VERSION_CODE < KERNEL_VERSION(4, 1, 0))
+	.read = new_sync_read,
+#endif /* LINUX_VERSION_CODE < KERNEL_VERSION(4, 1, 0) */
+	.read_iter = generic_file_read_iter,
+#if (LINUX_VERSION_CODE < KERNEL_VERSION(4, 1, 0))
+	.write = new_sync_write,
+#endif /* LINUX_VERSION_CODE < KERNEL_VERSION(4, 1, 0) */
+	.write_iter = generic_file_write_iter,
+	.mmap = generic_file_mmap,
+	.flush = yaffs_file_flush,
+	.fsync = yaffs_sync_object,
+	.splice_read = generic_file_splice_read,
+	.splice_write = iter_file_splice_write,
+	.llseek = generic_file_llseek,
+};
+
+#elif (LINUX_VERSION_CODE > KERNEL_VERSION(2, 6, 22))
 static const struct file_operations yaffs_file_operations = {
 	.read = do_sync_read,
 	.write = do_sync_write,
@@ -1716,7 +1734,7 @@ static int yaffs_iterate(struct file *f, struct dir_context *dc)
 
 	char name[YAFFS_MAX_NAME_LENGTH + 1];
 
-	obj = yaffs_dentry_to_obj(f->f_dentry);
+	obj = yaffs_dentry_to_obj(f->f_path.dentry);
 	dev = obj->my_dev;
 
 	yaffs_gross_lock(dev);
@@ -1780,14 +1798,14 @@ static int yaffs_readdir(struct file *f, void *dirent, filldir_t filldir)
 	struct yaffs_obj *obj;
 	struct yaffs_dev *dev;
 	struct yaffs_search_context *sc;
-	struct inode *inode = f->f_dentry->d_inode;
+	struct inode *inode = f->f_path.dentry->d_inode;
 	unsigned long offset, curoffs;
 	struct yaffs_obj *l;
 	int ret_val = 0;
 
 	char name[YAFFS_MAX_NAME_LENGTH + 1];
 
-	obj = yaffs_dentry_to_obj(f->f_dentry);
+	obj = yaffs_dentry_to_obj(f->f_path.dentry);
 	dev = obj->my_dev;
 
 	yaffs_gross_lock(dev);
@@ -1821,10 +1839,10 @@ static int yaffs_readdir(struct file *f, void *dirent, filldir_t filldir)
 	if (offset == 1) {
 		yaffs_trace(YAFFS_TRACE_OS,
 			"yaffs_readdir: entry .. ino %d",
-			(int)f->f_dentry->d_parent->d_inode->i_ino);
+			(int)f->f_path.dentry->d_parent->d_inode->i_ino);
 		yaffs_gross_unlock(dev);
 		if (filldir(dirent, "..", 2, offset,
-			    f->f_dentry->d_parent->d_inode->i_ino,
+			    f->f_path.dentry->d_parent->d_inode->i_ino,
 			    DT_DIR) < 0) {
 			yaffs_gross_lock(dev);
 			goto out;
@@ -2644,6 +2662,7 @@ static const struct super_operations yaffs_super_ops = {
 
 struct yaffs_options {
 	int inband_tags;
+	int tags_9bytes;
 	int skip_checkpoint_read;
 	int skip_checkpoint_write;
 	int no_cache;
@@ -2683,6 +2702,8 @@ static int yaffs_parse_options(struct yaffs_options *options,
 
 		if (!strcmp(cur_opt, "inband-tags")) {
 			options->inband_tags = 1;
+		} else if (!strcmp(cur_opt, "tags-9bytes")) {
+			options->tags_9bytes = 1;
 		} else if (!strcmp(cur_opt, "tags-ecc-off")) {
 			options->tags_ecc_on = 0;
 			options->tags_ecc_overridden = 1;
@@ -2756,7 +2777,6 @@ static struct super_block *yaffs_internal_read_super(int yaffs_version,
 	struct yaffs_param *param;
 
 	int read_only = 0;
-	int inband_tags = 0;
 
 	struct yaffs_options options;
 
@@ -2796,6 +2816,9 @@ static struct super_block *yaffs_internal_read_super(int yaffs_version,
 
 	memset(&options, 0, sizeof(options));
 
+	if (IS_ENABLED(CONFIG_YAFFS_9BYTE_TAGS))
+		options.tags_9bytes = 1;
+
 	if (yaffs_parse_options(&options, data_str)) {
 		/* Option parsing failed */
 		return NULL;
@@ -2829,17 +2852,22 @@ static struct super_block *yaffs_internal_read_super(int yaffs_version,
 	}
 
 	/* Added NCB 26/5/2006 for completeness */
-	if (yaffs_version == 2 && !options.inband_tags
-	    && WRITE_SIZE(mtd) == 512) {
+	if (yaffs_version == 2 &&
+	    (!options.inband_tags || options.tags_9bytes) &&
+	    WRITE_SIZE(mtd) == 512) {
 		yaffs_trace(YAFFS_TRACE_ALWAYS, "auto selecting yaffs1");
 		yaffs_version = 1;
 	}
 
-	if (mtd->oobavail < sizeof(struct yaffs_packed_tags2) ||
-	    options.inband_tags)
-		inband_tags = 1;
+	if (yaffs_version == 2 &&
+	    mtd->oobavail < sizeof(struct yaffs_packed_tags2)) {
+		yaffs_trace(YAFFS_TRACE_ALWAYS, "auto selecting inband tags");
+		options.inband_tags = 1;
+	}
 
-	if(yaffs_verify_mtd(mtd, yaffs_version, inband_tags) < 0)
+	err = yaffs_verify_mtd(mtd, yaffs_version, options.inband_tags,
+			       options.tags_9bytes);
+	if (err < 0)
 		return NULL;
 
 	/* OK, so if we got here, we have an MTD that's NAND and looks
@@ -2896,7 +2924,8 @@ static struct super_block *yaffs_internal_read_super(int yaffs_version,
 
 	param->n_reserved_blocks = 5;
 	param->n_caches = (options.no_cache) ? 0 : 10;
-	param->inband_tags = inband_tags;
+	param->inband_tags = options.inband_tags;
+	param->tags_9bytes = options.tags_9bytes;
 
 	param->enable_xattr = 1;
 	if (options.lazy_loading_overridden)

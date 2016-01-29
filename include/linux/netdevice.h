@@ -133,7 +133,7 @@ static inline bool dev_xmit_complete(int rc)
  */
 
 #if defined(CONFIG_WLAN) || IS_ENABLED(CONFIG_AX25)
-# if defined(CONFIG_MAC80211_MESH)
+# if 1 || defined(CONFIG_MAC80211_MESH)
 #  define LL_MAX_HEADER 128
 # else
 #  define LL_MAX_HEADER 96
@@ -1297,6 +1297,7 @@ enum netdev_priv_flags {
 	IFF_NO_QUEUE			= 1<<21,
 	IFF_OPENVSWITCH			= 1<<22,
 	IFF_L3MDEV_SLAVE		= 1<<23,
+	IFF_NO_IP_ALIGN			= 1<<24,
 };
 
 #define IFF_802_1Q_VLAN			IFF_802_1Q_VLAN
@@ -1323,6 +1324,7 @@ enum netdev_priv_flags {
 #define IFF_NO_QUEUE			IFF_NO_QUEUE
 #define IFF_OPENVSWITCH			IFF_OPENVSWITCH
 #define IFF_L3MDEV_SLAVE		IFF_L3MDEV_SLAVE
+#define IFF_NO_IP_ALIGN			IFF_NO_IP_ALIGN
 
 /**
  *	struct net_device - The DEVICE structure.
@@ -1603,6 +1605,11 @@ struct net_device {
 	const struct l3mdev_ops	*l3mdev_ops;
 #endif
 
+#ifdef CONFIG_ETHERNET_PACKET_MANGLE
+	void (*eth_mangle_rx)(struct net_device *dev, struct sk_buff *skb);
+	struct sk_buff *(*eth_mangle_tx)(struct net_device *dev, struct sk_buff *skb);
+#endif
+
 	const struct header_ops *header_ops;
 
 	unsigned int		flags;
@@ -1638,6 +1645,8 @@ struct net_device {
 	struct netdev_hw_addr_list	mc;
 	struct netdev_hw_addr_list	dev_addrs;
 
+	unsigned char		local_addr_mask[MAX_ADDR_LEN];
+
 #ifdef CONFIG_SYSFS
 	struct kset		*queues_kset;
 #endif
@@ -1665,6 +1674,10 @@ struct net_device {
 	struct wpan_dev		*ieee802154_ptr;
 #if IS_ENABLED(CONFIG_MPLS_ROUTING)
 	struct mpls_dev __rcu	*mpls_ptr;
+#endif
+
+#ifdef CONFIG_ETHERNET_PACKET_MANGLE
+	void			*phy_ptr; /* PHY device specific data */
 #endif
 
 /*

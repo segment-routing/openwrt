@@ -12,12 +12,14 @@
  */
 
 #include <linux/phy.h>
+#include <linux/mdio.h>
 #include <linux/module.h>
 #include <linux/string.h>
 #include <linux/netdevice.h>
 #include <linux/etherdevice.h>
 #include <linux/of_gpio.h>
 #include <linux/gpio/consumer.h>
+#include <linux/platform_data/phy-at803x.h>
 
 #define AT803X_INTR_ENABLE			0x12
 #define AT803X_INTR_STATUS			0x13
@@ -34,14 +36,26 @@
 #define AT803X_INER				0x0012
 #define AT803X_INER_INIT			0xec00
 #define AT803X_INSR				0x0013
+#define AT803X_REG_CHIP_CONFIG			0x1f
+#define AT803X_BT_BX_REG_SEL			0x8000
+#define AT803X_SGMII_ANEG_EN			0x1000
+
+#define AT803X_PCS_SMART_EEE_CTRL3			0x805D
+#define AT803X_SMART_EEE_CTRL3_LPI_TX_DELAY_SEL_MASK	0x3
+#define AT803X_SMART_EEE_CTRL3_LPI_TX_DELAY_SEL_SHIFT	12
+#define AT803X_SMART_EEE_CTRL3_LPI_EN			BIT(8)
+
 #define AT803X_DEBUG_ADDR			0x1D
 #define AT803X_DEBUG_DATA			0x1E
+#define AT803X_DBG0_REG				0x00
+#define AT803X_DEBUG_RGMII_RX_CLK_DLY		BIT(8)
 #define AT803X_DEBUG_SYSTEM_MODE_CTRL		0x05
 #define AT803X_DEBUG_RGMII_TX_CLK_DLY		BIT(8)
 
-#define ATH8030_PHY_ID 0x004dd076
-#define ATH8031_PHY_ID 0x004dd074
-#define ATH8035_PHY_ID 0x004dd072
+#define AT803X_PHY_ID_MASK			0xffffffef
+#define ATH8030_PHY_ID				0x004dd076
+#define ATH8031_PHY_ID				0x004dd074
+#define ATH8035_PHY_ID				0x004dd072
 
 MODULE_DESCRIPTION("Atheros 803x PHY driver");
 MODULE_AUTHOR("Matus Ujhelyi");
@@ -50,6 +64,7 @@ MODULE_LICENSE("GPL");
 struct at803x_priv {
 	bool phy_reset:1;
 	struct gpio_desc *gpiod_reset;
+	int prev_speed;
 };
 
 struct at803x_context {
@@ -60,6 +75,43 @@ struct at803x_context {
 	u16 smart_speed;
 	u16 led_control;
 };
+
+static u16
+at803x_dbg_reg_rmw(struct phy_device *phydev, u16 reg, u16 clear, u16 set)
+{
+	struct mii_bus *bus = phydev->bus;
+	int val;
+
+	mutex_lock(&bus->mdio_lock);
+
+	bus->write(bus, phydev->addr, AT803X_DEBUG_ADDR, reg);
+	val = bus->read(bus, phydev->addr, AT803X_DEBUG_DATA);
+	if (val < 0) {
+		val = 0xffff;
+		goto out;
+	}
+
+	val &= ~clear;
+	val |= set;
+	bus->write(bus, phydev->addr, AT803X_DEBUG_DATA, val);
+
+out:
+	mutex_unlock(&bus->mdio_lock);
+	return val;
+}
+
+static inline void
+at803x_dbg_reg_set(struct phy_device *phydev, u16 reg, u16 set)
+{
+	at803x_dbg_reg_rmw(phydev, reg, 0, set);
+}
+
+static inline void
+at803x_dbg_reg_clr(struct phy_device *phydev, u16 reg, u16 clear)
+{
+	at803x_dbg_reg_rmw(phydev, reg, clear, 0);
+}
+
 
 /* save relevant PHY registers to private copy */
 static void at803x_context_save(struct phy_device *phydev,
@@ -209,9 +261,38 @@ static int at803x_probe(struct phy_device *phydev)
 	return 0;
 }
 
+static void at803x_disable_smarteee(struct phy_device *phydev)
+{
+	phy_write_mmd(phydev, MDIO_MMD_PCS, AT803X_PCS_SMART_EEE_CTRL3,
+		1 << AT803X_SMART_EEE_CTRL3_LPI_TX_DELAY_SEL_SHIFT);
+	phy_write_mmd(phydev, MDIO_MMD_AN, MDIO_AN_EEE_ADV, 0);
+}
+
 static int at803x_config_init(struct phy_device *phydev)
 {
+	struct at803x_platform_data *pdata;
 	int ret;
+	u32 v;
+
+	if (phydev->drv->phy_id == ATH8031_PHY_ID &&
+		phydev->interface == PHY_INTERFACE_MODE_SGMII)
+	{
+		v = phy_read(phydev, AT803X_REG_CHIP_CONFIG);
+		/* select SGMII/fiber page */
+		ret = phy_write(phydev, AT803X_REG_CHIP_CONFIG,
+						v & ~AT803X_BT_BX_REG_SEL);
+		if (ret)
+			return ret;
+		/* enable SGMII autonegotiation */
+		ret = phy_write(phydev, MII_BMCR, AT803X_SGMII_ANEG_EN);
+		if (ret)
+			return ret;
+		/* select copper page */
+		ret = phy_write(phydev, AT803X_REG_CHIP_CONFIG,
+						v | AT803X_BT_BX_REG_SEL);
+		if (ret)
+			return ret;
+	}
 
 	ret = genphy_config_init(phydev);
 	if (ret < 0)
@@ -226,6 +307,26 @@ static int at803x_config_init(struct phy_device *phydev)
 				AT803X_DEBUG_RGMII_TX_CLK_DLY);
 		if (ret)
 			return ret;
+	}
+
+	pdata = dev_get_platdata(&phydev->dev);
+	if (pdata) {
+		if (pdata->disable_smarteee)
+			at803x_disable_smarteee(phydev);
+
+		if (pdata->enable_rgmii_rx_delay)
+			at803x_dbg_reg_set(phydev, AT803X_DBG0_REG,
+				AT803X_DEBUG_RGMII_RX_CLK_DLY);
+		else
+			at803x_dbg_reg_clr(phydev, AT803X_DBG0_REG,
+				AT803X_DEBUG_RGMII_RX_CLK_DLY);
+
+		if (pdata->enable_rgmii_tx_delay)
+			at803x_dbg_reg_set(phydev, AT803X_DEBUG_SYSTEM_MODE_CTRL,
+				AT803X_DEBUG_RGMII_TX_CLK_DLY);
+		else
+			at803x_dbg_reg_clr(phydev, AT803X_DEBUG_SYSTEM_MODE_CTRL,
+				AT803X_DEBUG_RGMII_TX_CLK_DLY);
 	}
 
 	return 0;
@@ -259,6 +360,8 @@ static int at803x_config_intr(struct phy_device *phydev)
 static void at803x_link_change_notify(struct phy_device *phydev)
 {
 	struct at803x_priv *priv = phydev->priv;
+	struct at803x_platform_data *pdata;
+	pdata = dev_get_platdata(&phydev->dev);
 
 	/*
 	 * Conduct a hardware reset for AT8030 every time a link loss is
@@ -289,6 +392,26 @@ static void at803x_link_change_notify(struct phy_device *phydev)
 			priv->phy_reset = false;
 		}
 	}
+	if (pdata && pdata->fixup_rgmii_tx_delay &&
+	    phydev->speed != priv->prev_speed) {
+		switch (phydev->speed) {
+		case SPEED_10:
+		case SPEED_100:
+			at803x_dbg_reg_set(phydev,
+				AT803X_DEBUG_SYSTEM_MODE_CTRL,
+				AT803X_DEBUG_RGMII_TX_CLK_DLY);
+			break;
+		case SPEED_1000:
+			at803x_dbg_reg_clr(phydev,
+				AT803X_DEBUG_SYSTEM_MODE_CTRL,
+				AT803X_DEBUG_RGMII_TX_CLK_DLY);
+			break;
+		default:
+			break;
+		}
+
+		priv->prev_speed = phydev->speed;
+	}
 }
 
 static struct phy_driver at803x_driver[] = {
@@ -296,7 +419,7 @@ static struct phy_driver at803x_driver[] = {
 	/* ATHEROS 8035 */
 	.phy_id			= ATH8035_PHY_ID,
 	.name			= "Atheros 8035 ethernet",
-	.phy_id_mask		= 0xffffffef,
+	.phy_id_mask		= AT803X_PHY_ID_MASK,
 	.probe			= at803x_probe,
 	.config_init		= at803x_config_init,
 	.link_change_notify	= at803x_link_change_notify,
@@ -317,7 +440,7 @@ static struct phy_driver at803x_driver[] = {
 	/* ATHEROS 8030 */
 	.phy_id			= ATH8030_PHY_ID,
 	.name			= "Atheros 8030 ethernet",
-	.phy_id_mask		= 0xffffffef,
+	.phy_id_mask		= AT803X_PHY_ID_MASK,
 	.probe			= at803x_probe,
 	.config_init		= at803x_config_init,
 	.link_change_notify	= at803x_link_change_notify,
@@ -337,8 +460,8 @@ static struct phy_driver at803x_driver[] = {
 }, {
 	/* ATHEROS 8031 */
 	.phy_id			= ATH8031_PHY_ID,
-	.name			= "Atheros 8031 ethernet",
-	.phy_id_mask		= 0xffffffef,
+	.name			= "Atheros 8031/8033 ethernet",
+	.phy_id_mask		= AT803X_PHY_ID_MASK,
 	.probe			= at803x_probe,
 	.config_init		= at803x_config_init,
 	.link_change_notify	= at803x_link_change_notify,
@@ -360,9 +483,9 @@ static struct phy_driver at803x_driver[] = {
 module_phy_driver(at803x_driver);
 
 static struct mdio_device_id __maybe_unused atheros_tbl[] = {
-	{ ATH8030_PHY_ID, 0xffffffef },
-	{ ATH8031_PHY_ID, 0xffffffef },
-	{ ATH8035_PHY_ID, 0xffffffef },
+	{ ATH8030_PHY_ID, AT803X_PHY_ID_MASK },
+	{ ATH8031_PHY_ID, AT803X_PHY_ID_MASK },
+	{ ATH8035_PHY_ID, AT803X_PHY_ID_MASK },
 	{ }
 };
 

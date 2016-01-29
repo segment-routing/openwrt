@@ -4880,6 +4880,11 @@ T:	git git://linuxtv.org/anttip/media_tree.git
 S:	Maintained
 F:	drivers/media/usb/hackrf/
 
+GPIOMMC DRIVER
+P:	Michael Buesch
+M:	mb@bu3sch.de
+S:	Maintained
+
 HARDWARE MONITORING
 M:	Jean Delvare <jdelvare@suse.com>
 M:	Guenter Roeck <linux@roeck-us.net>

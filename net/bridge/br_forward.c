@@ -141,7 +141,7 @@ EXPORT_SYMBOL_GPL(br_deliver);
 /* called with rcu_read_lock */
 void br_forward(const struct net_bridge_port *to, struct sk_buff *skb, struct sk_buff *skb0)
 {
-	if (to && should_deliver(to, skb)) {
+	if (to && should_deliver(to, skb) && !(to->flags & BR_ISOLATE_MODE)) {
 		if (skb0)
 			deliver_clone(to, skb, __br_forward);
 		else
@@ -192,12 +192,40 @@ out:
 	return p;
 }
 
+static struct net_bridge_port *maybe_deliver_addr(
+	struct net_bridge_port *prev, struct net_bridge_port *p,
+	struct sk_buff *skb, const unsigned char *addr,
+	void (*__packet_hook)(const struct net_bridge_port *p,
+			      struct sk_buff *skb))
+{
+	struct net_device *dev = BR_INPUT_SKB_CB(skb)->brdev;
+	const unsigned char *src = eth_hdr(skb)->h_source;
+
+	if (!should_deliver(p, skb))
+		return prev;
+
+	/* Even with hairpin, no soliloquies - prevent breaking IPv6 DAD */
+	if (skb->dev == p->dev && ether_addr_equal(src, addr))
+		return prev;
+
+	skb = skb_copy(skb, GFP_ATOMIC);
+	if (!skb) {
+		dev->stats.tx_dropped++;
+		return prev;
+	}
+
+	memcpy(eth_hdr(skb)->h_dest, addr, ETH_ALEN);
+	__packet_hook(p, skb);
+
+	return prev;
+}
+
 /* called under bridge lock */
 static void br_flood(struct net_bridge *br, struct sk_buff *skb,
 		     struct sk_buff *skb0,
 		     void (*__packet_hook)(const struct net_bridge_port *p,
 					   struct sk_buff *skb),
-		     bool unicast)
+		     				bool unicast, bool forward)
 {
 	struct net_bridge_port *p;
 	struct net_bridge_port *prev;
@@ -205,6 +233,8 @@ static void br_flood(struct net_bridge *br, struct sk_buff *skb,
 	prev = NULL;
 
 	list_for_each_entry_rcu(p, &br->port_list, list) {
+		if (forward && (p->flags & BR_ISOLATE_MODE))
+			continue;
 		/* Do not flood unicast traffic to ports that turn it off */
 		if (unicast && !(p->flags & BR_FLOOD))
 			continue;
@@ -239,14 +269,14 @@ out:
 /* called with rcu_read_lock */
 void br_flood_deliver(struct net_bridge *br, struct sk_buff *skb, bool unicast)
 {
-	br_flood(br, skb, NULL, __br_deliver, unicast);
+	br_flood(br, skb, NULL, __br_deliver, unicast, false);
 }
 
 /* called under bridge lock */
 void br_flood_forward(struct net_bridge *br, struct sk_buff *skb,
 		      struct sk_buff *skb2, bool unicast)
 {
-	br_flood(br, skb, skb2, __br_forward, unicast);
+	br_flood(br, skb, skb2, __br_forward, unicast, true);
 }
 
 #ifdef CONFIG_BRIDGE_IGMP_SNOOPING
@@ -262,6 +292,7 @@ static void br_multicast_flood(struct net_bridge_mdb_entry *mdst,
 	struct net_bridge_port *prev = NULL;
 	struct net_bridge_port_group *p;
 	struct hlist_node *rp;
+	const unsigned char *addr;
 
 	rp = rcu_dereference(hlist_first_rcu(&br->router_list));
 	p = mdst ? rcu_dereference(mdst->ports) : NULL;
@@ -272,10 +303,19 @@ static void br_multicast_flood(struct net_bridge_mdb_entry *mdst,
 		rport = rp ? hlist_entry(rp, struct net_bridge_port, rlist) :
 			     NULL;
 
-		port = (unsigned long)lport > (unsigned long)rport ?
-		       lport : rport;
+		if ((unsigned long)lport > (unsigned long)rport) {
+			port = lport;
+			addr = p->unicast ? p->eth_addr : NULL;
+		} else {
+			port = rport;
+			addr = NULL;
+		}
 
-		prev = maybe_deliver(prev, port, skb, __packet_hook);
+		if (addr)
+			prev = maybe_deliver_addr(prev, port, skb, addr,
+						  __packet_hook);
+		else
+			prev = maybe_deliver(prev, port, skb, __packet_hook);
 		if (IS_ERR(prev))
 			goto out;
 

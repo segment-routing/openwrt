@@ -17,6 +17,7 @@
 #include <linux/phy_fixed.h>
 #include <linux/interrupt.h>
 #include <linux/dma-mapping.h>
+#include <linux/platform_data/b53.h>
 #include <linux/bcm47xx_nvram.h>
 
 static const struct bcma_device_id bgmac_bcma_tbl[] = {
@@ -1538,6 +1539,17 @@ static void bgmac_mii_unregister(struct bgmac *bgmac)
 	mdiobus_free(mii_bus);
 }
 
+static struct b53_platform_data bgmac_b53_pdata = {
+};
+
+static struct platform_device bgmac_b53_dev = {
+	.name		= "b53-srab-switch",
+	.id		= -1,
+	.dev		= {
+		.platform_data = &bgmac_b53_pdata,
+	},
+};
+
 /**************************************************
  * BCMA bus ops
  **************************************************/
@@ -1641,8 +1653,11 @@ static int bgmac_probe(struct bcma_device *core)
 			ns_core = bcma_find_core_unit(core->bus,
 						      BCMA_CORE_MAC_GBIT,
 						      ns_gmac);
-			if (ns_core && !bcma_core_is_enabled(ns_core))
-				bcma_core_enable(ns_core, 0);
+			if (!ns_core)
+				continue;
+
+			bcma_core_disable(ns_core, 0);
+			bcma_core_enable(ns_core, 0);
 		}
 	}
 
@@ -1679,6 +1694,16 @@ static int bgmac_probe(struct bcma_device *core)
 	net_dev->hw_features = net_dev->features;
 	net_dev->vlan_features = net_dev->features;
 
+	if ((ci->id == BCMA_CHIP_ID_BCM4707 ||
+	     ci->id == BCMA_CHIP_ID_BCM53018) &&
+	    !bgmac_b53_pdata.regs) {
+		bgmac_b53_pdata.regs = ioremap_nocache(0x18007000, 0x1000);
+
+		err = platform_device_register(&bgmac_b53_dev);
+		if (!err)
+			bgmac->b53_device = &bgmac_b53_dev;
+	}
+
 	err = register_netdev(bgmac->net_dev);
 	if (err) {
 		bgmac_err(bgmac, "Cannot register net device\n");
@@ -1704,6 +1729,10 @@ err_netdev_free:
 static void bgmac_remove(struct bcma_device *core)
 {
 	struct bgmac *bgmac = bcma_get_drvdata(core);
+
+	if (bgmac->b53_device)
+		platform_device_unregister(&bgmac_b53_dev);
+	bgmac->b53_device = NULL;
 
 	unregister_netdev(bgmac->net_dev);
 	bgmac_mii_unregister(bgmac);

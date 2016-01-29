@@ -45,6 +45,8 @@ struct br_ip_list {
 #define BR_PROXYARP		BIT(8)
 #define BR_LEARNING_SYNC	BIT(9)
 #define BR_PROXYARP_WIFI	BIT(10)
+#define BR_ISOLATE_MODE	BIT(11)
+#define BR_MULTICAST_TO_UCAST	BIT(12)
 
 /* values as per ieee8021QBridgeFdbAgingTime */
 #define BR_MIN_AGEING_TIME	(10 * HZ)
