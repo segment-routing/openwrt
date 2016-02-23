@@ -55,7 +55,6 @@
 #include <net/xfrm.h>
 #include <net/checksum.h>
 #include <linux/mroute6.h>
-#include <net/seg6.h>
 #include <net/l3mdev.h>
 
 static int ip6_finish_output2(struct net *net, struct sock *sk, struct sk_buff *skb)
@@ -447,21 +446,6 @@ int ip6_forward(struct sk_buff *skb)
 			IP6_INC_STATS_BH(net, ip6_dst_idev(dst),
 					 IPSTATS_MIB_INDISCARDS);
 			goto drop;
-		}
-	}
-
-	/* apply srh if needed */
-	if (seg6_process_skb(net, skb)) {
-		if (!seg6_enable_netdev_rx) {
-			if (seg6_enable_netdev_swap)
-				skb->dev = net->ipv6.sr6tun_dev;
-			skb_dst_drop(skb);
-			ip6_route_input(skb);
-			return dst_input(skb);
-		} else {
-			__skb_tunnel_rx(skb, net->ipv6.sr6tun_dev, net);
-			netif_rx(skb);
-			return 0;
 		}
 	}
 
