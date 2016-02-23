@@ -42,7 +42,6 @@
 #include <crypto/sha.h>
 #include <net/seg6.h>
 #include <net/genetlink.h>
-#include <net/seg6_table.h>
 #include <net/seg6_hmac.h>
 #include <linux/random.h>
 
@@ -116,7 +115,7 @@ int sr_hmac_sha1(u8 *key, u8 ksize, struct ipv6_sr_hdr *hdr,
 		memcpy(pptr, saddr->s6_addr, 16);
 		pptr += 16;
 		*pptr++ = hdr->first_segment;
-		*pptr++ = !!(sr_get_flags(hdr) & SR6_FLAG_CLEANUP);
+		*pptr++ = !!(sr_get_flags(hdr) & SR6_FLAG_CLEANUP) << 7;
 		*pptr++ = sr_get_hmac_key_id(hdr);
 
 		for (i = 0; i < hdr->first_segment + 1; i += 1) {
