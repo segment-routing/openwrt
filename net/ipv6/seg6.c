@@ -48,7 +48,7 @@
 #include <linux/seg6_genl.h>
 
 int seg6_srh_reversal;
-int seg6_hmac_strict_key;
+int seg6_hmac_strict_key = 1;
 int seg6_enabled = 1;
 
 static void copy_segments_reverse(struct in6_addr *dst, struct in6_addr *src,
@@ -60,56 +60,100 @@ static void copy_segments_reverse(struct in6_addr *dst, struct in6_addr *src,
 		memcpy(&dst[size - i - 1], &src[i], sizeof(struct in6_addr));
 }
 
-struct seg6_bib_node *seg6_bib_lookup(struct net *net, struct in6_addr *segment)
+/* called with rcu_read_lock() */
+struct seg6_action *seg6_action_lookup(struct net *net,
+				       struct in6_addr *segment)
 {
-	struct seg6_bib_node *tmp;
+	struct seg6_pernet_data *sdata = seg6_pernet(net);
+	struct seg6_action *act;
 
-	for (tmp = net->ipv6.seg6_bib_head; tmp; tmp = tmp->next) {
-		if (memcmp(&tmp->segment, segment, 16) == 0)
-			return tmp;
+	list_for_each_entry_rcu(act, &sdata->actions, list) {
+		if (memcmp(&act->segment, segment, 16) == 0)
+			return act;
 	}
 
 	return NULL;
 }
+EXPORT_SYMBOL(seg6_action_lookup);
 
-int seg6_bib_insert(struct net *net, struct seg6_bib_node *bib)
+static int seg6_action_add(struct net *net, struct seg6_action *act)
 {
-	struct seg6_bib_node *tmp;
+	struct seg6_pernet_data *sdata = seg6_pernet(net);
+	int err = 0;
+	struct seg6_action *old_act;
 
-	if (!net->ipv6.seg6_bib_head) {
-		net->ipv6.seg6_bib_head = bib;
-		return 0;
-	}
-
-	for (tmp = net->ipv6.seg6_bib_head; tmp; tmp = tmp->next) {
-		if (memcmp(&tmp->segment, &bib->segment, 16) == 0)
-			return -EEXIST;
-
-		if (!tmp->next) {
-			tmp->next = bib;
-			break;
+	seg6_pernet_lock(net);
+	if ((old_act = seg6_action_lookup(net, &act->segment)) != NULL) {
+		if (act->flags & SEG6_BIND_FLAG_OVERRIDE) {
+			list_del_rcu(&old_act->list);
+		} else {
+			err = -EEXIST;
+			goto out_unlock;
 		}
 	}
 
-	return 0;
+	list_add_rcu(&act->list, &sdata->actions);
+	seg6_pernet_unlock(net);
+
+	if (old_act) {
+		synchronize_net();
+		if (old_act->data)
+			kfree(old_act->data);
+		kfree(old_act);
+	}
+
+out:
+	return err;
+out_unlock:
+	seg6_pernet_unlock(net);
+	goto out;
 }
 
-int seg6_bib_remove(struct net *net, struct in6_addr *addr)
+static int seg6_action_del(struct net *net, struct in6_addr *dst)
 {
-	struct seg6_bib_node *tmp, *prev = NULL;
+	struct seg6_action *act;
+	int err = 0;
 
-	for (tmp = net->ipv6.seg6_bib_head; tmp; tmp = tmp->next) {
-		if (memcmp(&tmp->segment, addr, 16) == 0) {
-			if (prev)
-				prev->next = tmp->next;
-			else
-				net->ipv6.seg6_bib_head = tmp->next;
-			return 1;
-		}
-		prev = tmp;
+	seg6_pernet_lock(net);
+	act = seg6_action_lookup(net, dst);
+	if (!act) {
+		err = -ENOENT;
+		goto out_unlock;
+	}
+	list_del_rcu(&act->list);
+	seg6_pernet_unlock(net);
+
+	synchronize_net();
+	if (act->data)
+		kfree(act->data);
+	kfree(act);
+
+out:
+	return err;
+out_unlock:
+	seg6_pernet_unlock(net);
+	goto out;
+}
+
+static void seg6_action_flush(struct net *net)
+{
+	struct seg6_pernet_data *sdata = seg6_pernet(net);
+	struct seg6_action *act;
+
+	seg6_pernet_lock(net);
+	while ((act = list_first_or_null_rcu(&sdata->actions,
+					     struct seg6_action,
+					     list)) != NULL) {
+		list_del_rcu(&act->list);
+		seg6_pernet_unlock(net);
+		synchronize_net();
+		if (act->data)
+			kfree(act->data);
+		kfree(act);
+		seg6_pernet_lock(net);
 	}
 
-	return 0;
+	seg6_pernet_unlock(net);
 }
 
 void seg6_srh_to_tmpl(struct ipv6_sr_hdr *hdr_from, struct ipv6_sr_hdr *hdr_to,
@@ -131,43 +175,6 @@ void seg6_srh_to_tmpl(struct ipv6_sr_hdr *hdr_from, struct ipv6_sr_hdr *hdr_to,
 		       (seg_size - 1) * sizeof(struct in6_addr));
 
 	memset(hdr_to->segments, 0x42, sizeof(struct in6_addr));
-}
-
-static struct ctl_table seg6_table[] = {
-	{
-		.procname	= "hmac_key",
-		.data		= seg6_hmac_key,
-		.maxlen		= SEG6_HMAC_MAX_SIZE,
-		.mode		= 0644,
-		.proc_handler	= proc_dostring,
-	},
-	{
-		.procname	= "srh_reversal",
-		.data		= &seg6_srh_reversal,
-		.maxlen		= sizeof(int),
-		.mode		= 0644,
-		.proc_handler	= &proc_dointvec
-	},
-	{
-		.procname	= "hmac_strict_key",
-		.data		= &seg6_hmac_strict_key,
-		.maxlen		= sizeof(int),
-		.mode		= 0644,
-		.proc_handler	= &proc_dointvec
-	},
-	{
-		.procname	= "enabled",
-		.data		= &seg6_enabled,
-		.maxlen		= sizeof(int),
-		.mode		= 0644,
-		.proc_handler	= &proc_dointvec
-	},
-	{ }
-};
-
-void __net_init seg6_init_sysctl(void)
-{
-	register_net_sysctl(&init_net, "net/seg6", seg6_table);
 }
 
 static struct nla_policy seg6_genl_policy[SEG6_ATTR_MAX + 1] = {
@@ -213,7 +220,7 @@ static struct genl_family seg6_genl_family = {
  * /!\ We are in atomic context.
  *
  */
-int seg6_nl_packet_in(struct net *net, struct sk_buff *skb, void *bib_data)
+int seg6_nl_packet_in(struct net *net, struct sk_buff *skb, void *act_data)
 {
 	struct sk_buff *skb2, *msg;
 	struct ipv6_sr_hdr *srhdr;
@@ -223,8 +230,8 @@ int seg6_nl_packet_in(struct net *net, struct sk_buff *skb, void *bib_data)
 	u32 portid;
 	struct sock *dst_sk;
 
-	portid = *(u32 *)bib_data;
-	dst_sk = *(struct sock **)(bib_data + sizeof(u32));
+	portid = *(u32 *)act_data;
+	dst_sk = *(struct sock **)(act_data + sizeof(u32));
 
 	skb2 = skb_copy(skb, GFP_ATOMIC); /* linearize */
 	srhdr = (struct ipv6_sr_hdr *)skb_transport_header(skb2);
@@ -333,6 +340,8 @@ static int seg6_genl_sethmac(struct sk_buff *skb, struct genl_info *info)
 	u8 algid;
 	u8 slen;
 	struct seg6_hmac_info *hinfo;
+	int err = 0;
+	struct seg6_pernet_data *sdata = seg6_pernet(net);
 
 	if (!info->attrs[SEG6_ATTR_HMACKEYID] ||
 	    !info->attrs[SEG6_ATTR_SECRETLEN] ||
@@ -346,47 +355,72 @@ static int seg6_genl_sethmac(struct sk_buff *skb, struct genl_info *info)
 	if (hmackeyid == 0)
 		return -EINVAL;
 
-	hinfo = net->ipv6.seg6_hmac_table[hmackeyid];
+	seg6_pernet_lock(net);
+
+	hinfo = sdata->hmac_table[hmackeyid];
 
 	if (!slen) {
-		if (!hinfo)
-			return -ENOENT;
-		kfree(hinfo);
-		net->ipv6.seg6_hmac_table[hmackeyid] = NULL;
-		return 0;
+		if (!hinfo || seg6_hmac_del_info(net, hmackeyid, hinfo)) {
+			err = -ENOENT;
+		} else {
+			kfree(hinfo);
+		}
+		goto out_unlock;
 	}
 
-	if (!info->attrs[SEG6_ATTR_SECRET])
-		return -EINVAL;
+	if (!info->attrs[SEG6_ATTR_SECRET]) {
+		err = -EINVAL;
+		goto out_unlock;
+	}
+
+	if (hinfo) {
+		if (seg6_hmac_del_info(net, hmackeyid, hinfo)) {
+			err = -ENOENT;
+			goto out_unlock;
+		}
+		kfree(hinfo);
+	}
 
 	secret = (char *)nla_data(info->attrs[SEG6_ATTR_SECRET]);
 
-	if (!hinfo)
-		hinfo = kzalloc(sizeof(*hinfo), GFP_KERNEL);
-
-	if (!hinfo)
-		return -ENOMEM;
+	hinfo = kzalloc(sizeof(*hinfo), GFP_KERNEL);
+	if (!hinfo) {
+		err = -ENOMEM;
+		goto out_unlock;
+	}
 
 	memcpy(hinfo->secret, secret, slen);
 	hinfo->slen = slen;
 	hinfo->alg_id = algid;
 
-	net->ipv6.seg6_hmac_table[hmackeyid] = hinfo;
+	seg6_hmac_add_info(net, hmackeyid, hinfo);
 
-	return 0;
+out_unlock:
+	seg6_pernet_unlock(net);
+	return err;
 }
 
 static int seg6_genl_set_tunsrc(struct sk_buff *skb, struct genl_info *info)
 {
 	struct net *net = genl_info_net(info);
-	struct in6_addr *tunsrc;
+	struct seg6_pernet_data *sdata = seg6_pernet(net);
+	struct in6_addr *val, *t_old, *t_new;
 
 	if (!info->attrs[SEG6_ATTR_DST])
 		return -EINVAL;
 
-	tunsrc = (struct in6_addr *)nla_data(info->attrs[SEG6_ATTR_DST]);
+	val = (struct in6_addr *)nla_data(info->attrs[SEG6_ATTR_DST]);
+	t_new = kmemdup(val, sizeof(*val), GFP_KERNEL);
 
-	memcpy(&net->ipv6.seg6_tun_src, tunsrc, sizeof(struct in6_addr));
+	seg6_pernet_lock(net);
+
+	t_old = sdata->tun_src;
+	rcu_assign_pointer(sdata->tun_src, t_new);
+
+	seg6_pernet_unlock(net);
+
+	synchronize_net();
+	kfree(t_old);
 
 	return 0;
 }
@@ -396,6 +430,7 @@ static int seg6_genl_get_tunsrc(struct sk_buff *skb, struct genl_info *info)
 	struct net *net = genl_info_net(info);
 	struct sk_buff *msg;
 	void *hdr;
+	struct in6_addr *tun_src;
 
 	msg = netlink_alloc_skb(info->dst_sk,
 				nlmsg_total_size(NLMSG_DEFAULT_SIZE),
@@ -408,9 +443,13 @@ static int seg6_genl_get_tunsrc(struct sk_buff *skb, struct genl_info *info)
 	if (!hdr)
 		goto free_msg;
 
-	if (nla_put(msg, SEG6_ATTR_DST, sizeof(struct in6_addr),
-		    &net->ipv6.seg6_tun_src))
+	rcu_read_lock();
+	tun_src = rcu_dereference(seg6_pernet(net)->tun_src);
+
+	if (nla_put(msg, SEG6_ATTR_DST, sizeof(struct in6_addr), tun_src))
 		goto nla_put_failure;
+
+	rcu_read_unlock();
 
 	genlmsg_end(msg, hdr);
 	genlmsg_reply(msg, info);
@@ -418,6 +457,7 @@ static int seg6_genl_get_tunsrc(struct sk_buff *skb, struct genl_info *info)
 	return 0;
 
 nla_put_failure:
+	rcu_read_unlock();
 	genlmsg_cancel(msg, hdr);
 free_msg:
 	nlmsg_free(msg);
@@ -463,11 +503,12 @@ static int seg6_genl_dumphmac(struct sk_buff *skb, struct netlink_callback *cb)
 	struct seg6_hmac_info *hinfo;
 	int i, ret;
 
+	rcu_read_lock();
 	for (i = 0; i < 255; i++) {
 		if (i < cb->args[0])
 			continue;
 
-		hinfo = net->ipv6.seg6_hmac_table[i];
+		hinfo = rcu_dereference(seg6_pernet(net)->hmac_table[i]);
 		if (!hinfo)
 			continue;
 
@@ -479,6 +520,7 @@ static int seg6_genl_dumphmac(struct sk_buff *skb, struct netlink_callback *cb)
 		if (ret)
 			break;
 	}
+	rcu_read_unlock();
 
 	cb->args[0] = i;
 	return skb->len;
@@ -488,8 +530,8 @@ static int seg6_genl_addbind(struct sk_buff *skb, struct genl_info *info)
 {
 	struct net *net = genl_info_net(info);
 	struct in6_addr *dst;
-	struct seg6_bib_node *bib;
-	int err, op, datalen;
+	struct seg6_action *act;
+	int op, datalen, err = 0;
 
 	if (!info->attrs[SEG6_ATTR_DST] || !info->attrs[SEG6_ATTR_BIND_OP])
 		return -EINVAL;
@@ -501,92 +543,87 @@ static int seg6_genl_addbind(struct sk_buff *skb, struct genl_info *info)
 	    !info->attrs[SEG6_ATTR_BIND_DATALEN])
 		return -EINVAL;
 
-	bib = kzalloc(sizeof(*bib), GFP_KERNEL);
-	if (!bib)
+	act = kzalloc(sizeof(*act), GFP_KERNEL);
+	if (!act)
 		return -ENOMEM;
 
-	bib->op = op;
+	act->op = op;
 
 	if (info->attrs[SEG6_ATTR_FLAGS])
-		bib->flags = nla_get_u32(info->attrs[SEG6_ATTR_FLAGS]);
+		act->flags = nla_get_u32(info->attrs[SEG6_ATTR_FLAGS]);
 
 	if (op == SEG6_BIND_SERVICE) {
-		bib->data = kzalloc(sizeof(u32) + sizeof(struct sock *),
+		act->data = kzalloc(sizeof(u32) + sizeof(struct sock *),
 				    GFP_KERNEL);
-		if (!bib->data) {
-			kfree(bib);
+		if (!act->data) {
+			kfree(act);
 			return -ENOMEM;
 		}
-		*(u32 *)bib->data = info->snd_portid;
-		bib->datalen = sizeof(u32) + sizeof(struct sock *);
-		*(struct sock **)(bib->data + sizeof(u32)) = info->dst_sk;
+		*(u32 *)act->data = info->snd_portid;
+		act->datalen = sizeof(u32) + sizeof(struct sock *);
+		*(struct sock **)(act->data + sizeof(u32)) = info->dst_sk;
 	} else {
 		datalen = nla_get_s32(info->attrs[SEG6_ATTR_BIND_DATALEN]);
-		bib->data = kzalloc(datalen, GFP_KERNEL);
-		if (!bib->data) {
-			kfree(bib);
+		act->data = kzalloc(datalen, GFP_KERNEL);
+		if (!act->data) {
+			kfree(act);
 			return -ENOMEM;
 		}
-		bib->datalen = datalen;
-		memcpy(bib->data, nla_data(info->attrs[SEG6_ATTR_BIND_DATA]),
+		act->datalen = datalen;
+		memcpy(act->data, nla_data(info->attrs[SEG6_ATTR_BIND_DATA]),
 		       datalen);
 	}
 
-	memcpy(&bib->segment, dst, 16);
+	memcpy(&act->segment, dst, 16);
 
-	err = seg6_bib_insert(net, bib);
+	if (unlikely((err = seg6_action_add(net, act)) < 0))
+		goto out_free;
 
+out:
 	return err;
+out_free:
+	if (act->data)
+		kfree(act->data);
+	kfree(act);
+	goto out;
 }
 
 static int seg6_genl_delbind(struct sk_buff *skb, struct genl_info *info)
 {
 	struct net *net = genl_info_net(info);
 	struct in6_addr *dst;
-	struct seg6_bib_node *bib;
 
 	if (!info->attrs[SEG6_ATTR_DST])
 		return -EINVAL;
 
 	dst = (struct in6_addr *)nla_data(info->attrs[SEG6_ATTR_DST]);
 
-	bib = seg6_bib_lookup(net, dst);
-	if (!bib)
-		return -ENOENT;
-
-	seg6_bib_remove(net, &bib->segment);
-	kfree(bib);
-
-	return 0;
+	return seg6_action_del(net, dst);
 }
 
 static int seg6_genl_flushbind(struct sk_buff *skb, struct genl_info *info)
 {
 	struct net *net = genl_info_net(info);
-	struct seg6_bib_node *bib;
 
-	while ((bib = net->ipv6.seg6_bib_head)) {
-		net->ipv6.seg6_bib_head = bib->next;
-		kfree(bib);
-	}
+	seg6_action_flush(net);
 
 	return 0;
 }
 
-static int __seg6_bind_fill_info(struct seg6_bib_node *bib,
+static int __seg6_bind_fill_info(struct seg6_action *act,
 				 struct sk_buff *msg)
 {
 	if (nla_put(msg, SEG6_ATTR_DST, sizeof(struct in6_addr),
-		    &bib->segment) ||
-	    nla_put(msg, SEG6_ATTR_BIND_DATA, bib->datalen, bib->data) ||
-	    nla_put_s32(msg, SEG6_ATTR_BIND_DATALEN, bib->datalen) ||
-	    nla_put_u8(msg, SEG6_ATTR_BIND_OP, bib->op))
+		    &act->segment) ||
+	    nla_put(msg, SEG6_ATTR_BIND_DATA, act->datalen, act->data) ||
+	    nla_put_s32(msg, SEG6_ATTR_BIND_DATALEN, act->datalen) ||
+	    nla_put_u8(msg, SEG6_ATTR_BIND_OP, act->op))
 		return -1;
 
 	return 0;
 }
 
-static int __seg6_genl_dumpbind_element(struct seg6_bib_node *bib, u32 portid,
+static int __seg6_genl_dumpbind_element(struct seg6_action *act, u32 portid,
 					u32 seq, u32 flags, struct sk_buff *skb,
 					u8 cmd)
 {
@@ -596,7 +633,7 @@ static int __seg6_genl_dumpbind_element(struct seg6_bib_node *bib, u32 portid,
 	if (!hdr)
 		return -ENOMEM;
 
-	if (__seg6_bind_fill_info(bib, skb) < 0)
+	if (__seg6_bind_fill_info(act, skb) < 0)
 		goto nla_put_failure;
 
 	genlmsg_end(skb, hdr);
@@ -610,14 +647,17 @@ nla_put_failure:
 static int seg6_genl_dumpbind(struct sk_buff *skb, struct netlink_callback *cb)
 {
 	struct net *net = sock_net(skb->sk);
-	struct seg6_bib_node *bib;
+	struct seg6_pernet_data *sdata = seg6_pernet(net);
+	struct seg6_action *act;
 	int idx = 0, ret;
 
-	for (bib = net->ipv6.seg6_bib_head; bib; bib = bib->next) {
+	rcu_read_lock();
+
+	list_for_each_entry_rcu(act, &sdata->actions, list) {
 		if (idx++ < cb->args[0])
 			continue;
 
-		ret = __seg6_genl_dumpbind_element(bib,
+		ret = __seg6_genl_dumpbind_element(act,
 						   NETLINK_CB(cb->skb).portid,
 						   cb->nlh->nlmsg_seq,
 						   NLM_F_MULTI, skb,
@@ -625,6 +665,8 @@ static int seg6_genl_dumpbind(struct sk_buff *skb, struct netlink_callback *cb)
 		if (ret)
 			break;
 	}
+
+	rcu_read_unlock();
 
 	cb->args[0] = idx;
 	return skb->len;
@@ -687,7 +729,114 @@ static struct genl_ops seg6_genl_ops[] = {
 	},
 };
 
-void __net_init seg6_nl_init(void)
+static struct ctl_table seg6_table[] = {
+	{
+		.procname	= "hmac_key",
+		.data		= seg6_hmac_key,
+		.maxlen		= SEG6_HMAC_MAX_SIZE,
+		.mode		= 0644,
+		.proc_handler	= proc_dostring,
+	},
+	{
+		.procname	= "srh_reversal",
+		.data		= &seg6_srh_reversal,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= &proc_dointvec
+	},
+	{
+		.procname	= "hmac_strict_key",
+		.data		= &seg6_hmac_strict_key,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= &proc_dointvec
+	},
+	{
+		.procname	= "enabled",
+		.data		= &seg6_enabled,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= &proc_dointvec
+	},
+	{ }
+};
+
+static struct ctl_table_header *seg6_table_hdr;
+
+static int __net_init seg6_net_init(struct net *net)
 {
-	genl_register_family_with_ops(&seg6_genl_family, seg6_genl_ops);
+	struct seg6_pernet_data *sdata;
+
+	net->ipv6.seg6_data = kzalloc(sizeof(struct seg6_pernet_data),
+				      GFP_KERNEL);
+
+	sdata = seg6_pernet(net);
+	if (!sdata)
+		return -ENOMEM;
+
+	spin_lock_init(&sdata->lock);
+
+	sdata->tun_src = kzalloc(sizeof(struct in6_addr), GFP_KERNEL);
+
+	INIT_LIST_HEAD(&sdata->actions);
+
+	return 0;
+}
+
+static void __net_exit seg6_net_exit(struct net *net)
+{
+	struct seg6_pernet_data *sdata = seg6_pernet(net);
+	int i;
+
+	seg6_action_flush(net);
+
+	for (i = 0; i < SEG6_MAX_HMAC_KEY; i++) {
+		if (sdata->hmac_table[i])
+			kfree(sdata->hmac_table[i]);
+	}
+
+	kfree(seg6_pernet(net));
+}
+
+static struct pernet_operations ip6_segments_ops = {
+	.init = seg6_net_init,
+	.exit = seg6_net_exit,
+};
+
+int __init seg6_init(void)
+{
+	int err = -ENOMEM;
+
+#ifdef CONFIG_SYSCTL
+	seg6_table_hdr = register_net_sysctl(&init_net, "net/seg6", seg6_table);
+	if (!seg6_table_hdr)
+		goto out;
+#endif
+	err = genl_register_family_with_ops(&seg6_genl_family, seg6_genl_ops);
+	if (err)
+		goto out_unregister_sysctl;
+	err = register_pernet_subsys(&ip6_segments_ops);
+	if (err)
+		goto out_unregister_genl;
+
+	pr_info("SR-IPv6: Release v%d.%d\n", SEG6_VERSION_MAJOR,
+		SEG6_VERSION_MINOR);
+out:
+	return err;
+out_unregister_genl:
+	genl_unregister_family(&seg6_genl_family);
+out_unregister_sysctl:
+#ifdef CONFIG_SYSCTL
+	unregister_net_sysctl_table(seg6_table_hdr);
+#endif
+	goto out;
+}
+
+void seg6_exit(void)
+{
+	unregister_pernet_subsys(&ip6_segments_ops);
+	genl_unregister_family(&seg6_genl_family);
+#ifdef CONFIG_SYSCTL
+	unregister_net_sysctl_table(seg6_table_hdr);
+#endif
 }

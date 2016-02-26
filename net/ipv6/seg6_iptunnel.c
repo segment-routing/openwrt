@@ -64,26 +64,37 @@ static int __push_hmac(struct net *net, struct in6_addr *saddr,
 	struct seg6_hmac_info *hinfo;
 	int err;
 
-	hinfo = net->ipv6.seg6_hmac_table[srh->hmackeyid];
+	rcu_read_lock();
+
+	hinfo = rcu_dereference(seg6_pernet(net)->hmac_table[srh->hmackeyid]);
 	key = hinfo ? hinfo->secret : seg6_hmac_key;
 	keylen = hinfo ? hinfo->slen : strlen(seg6_hmac_key);
 
-	if (unlikely((err = sr_hmac_sha1(key, keylen, srh, saddr,
-					 (u32 *)SEG6_HMAC(srh)))))
-		return err;
+	err = sr_hmac_sha1(key, keylen, srh, saddr, (u32 *)SEG6_HMAC(srh));
 
-	return 0;
+	rcu_read_unlock();
+
+	return err;
 }
 
 static void __set_tun_src(struct net *net, struct net_device *dev,
 			  struct in6_addr *daddr, struct in6_addr *saddr)
 {
-	if (!ipv6_addr_any(&net->ipv6.seg6_tun_src)) {
-		memcpy(saddr, &net->ipv6.seg6_tun_src, sizeof(struct in6_addr));
+	struct in6_addr *tun_src;
+	struct seg6_pernet_data *sdata = seg6_pernet(net);
+
+	rcu_read_lock();
+
+	tun_src = rcu_dereference(sdata->tun_src);
+
+	if (!ipv6_addr_any(tun_src)) {
+		memcpy(saddr, tun_src, sizeof(struct in6_addr));
 	} else {
 		ipv6_dev_get_saddr(net, dev, daddr, IPV6_PREFER_SRC_PUBLIC,
 				   saddr);
 	}
+
+	rcu_read_unlock();
 }
 
 static int seg6_do_srh_encap(struct sk_buff *skb, struct ipv6_sr_hdr *osrh)
