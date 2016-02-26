@@ -306,8 +306,9 @@ static int ipv6_srh_rcv(struct sk_buff *skb)
 	int nh, srhlen;
 	struct inet6_dev *idev;
 	struct seg6_hmac_info *hinfo;
-	struct seg6_bib_node *bib_node;
+	struct seg6_action *act;
 	struct in6_addr *neigh_rt = NULL;
+	struct seg6_pernet_data *sdata = seg6_pernet(net);
 
 	hdr = (struct ipv6_sr_hdr *)skb_transport_header(skb);
 
@@ -339,7 +340,7 @@ static int ipv6_srh_rcv(struct sk_buff *skb)
 			return -1;
 		}
 
-		hinfo = net->ipv6.seg6_hmac_table[hmac_key_id];
+		hinfo = rcu_dereference(sdata->hmac_table[hmac_key_id]);
 
 		if (!hinfo && seg6_hmac_strict_key) {
 			pr_debug("SR-IPv6: hmac_strict_key is set and no key found for keyid 0x%x\n", hmac_key_id);
@@ -371,7 +372,7 @@ looped_back:
 	last_addr = hdr->segments;
 
 	if (hdr->segments_left > 0) {
-		if (hdr->segments_left == 1 &&
+		if (hdr->nexthdr != NEXTHDR_IPV6 && hdr->segments_left == 1 &&
 		    sr_get_flags(hdr) & SR6_FLAG_CLEANUP)
 			cleanup = 1;
 	} else {
@@ -403,8 +404,17 @@ looped_back:
 		return 1;
 	}
 
-	if (__prepare_mod_skb(net, skb) < 0)
-		return -1;
+	if (skb_cloned(skb)) {
+		if (pskb_expand_head(skb, 0, 0, GFP_ATOMIC)) {
+			IP6_INC_STATS_BH(net, ip6_dst_idev(skb_dst(skb)),
+					 IPSTATS_MIB_OUTDISCARDS);
+			kfree_skb(skb);
+			return -1;
+		}
+	}
+
+	if (skb->ip_summed == CHECKSUM_COMPLETE)
+		skb->ip_summed = CHECKSUM_NONE;
 
 	hdr = (struct ipv6_sr_hdr *)skb_transport_header(skb);
 
@@ -413,27 +423,27 @@ looped_back:
 	addr = hdr->segments + hdr->segments_left;
 
 	/* check if active segment is a Binding-SID */
-	bib_node = seg6_bib_lookup(net, active_addr);
-	if (bib_node) {
-		switch (bib_node->op) {
+	act = seg6_action_lookup(net, active_addr);
+	if (act) {
+		switch (act->op) {
 		case SEG6_BIND_ROUTE:
-			neigh_rt = (struct in6_addr *)bib_node->data;
+			neigh_rt = (struct in6_addr *)act->data;
 			break;
 		case SEG6_BIND_SERVICE:
 		{
 			int rc;
 
-			rc = seg6_nl_packet_in(net, skb, bib_node->data);
-			if (rc < 0 && rc != -EAGAIN) {
-				seg6_bib_remove(net, active_addr);
-			} else if (!(bib_node->flags & SEG6_BIND_FLAG_ASYM)) {
+			rc = seg6_nl_packet_in(net, skb, act->data);
+
+			if (!(act->flags & SEG6_BIND_FLAG_ASYM)) {
 				kfree_skb(skb);
 				return -1;
 			}
+
 			break;
 		}
 		case SEG6_BIND_OVERRIDE_NEXT:
-			memcpy(addr, bib_node->data, sizeof(struct in6_addr));
+			memcpy(addr, act->data, sizeof(struct in6_addr));
 			break;
 		default:
 			break;
@@ -910,14 +920,17 @@ static void ipv6_push_rthdr(struct sk_buff *skb, u8 *proto,
 			char *key;
 			int keylen;
 			struct seg6_hmac_info *hinfo;
+			struct seg6_pernet_data *sdata = seg6_pernet(net);
 
-			hinfo = net->ipv6.seg6_hmac_table[hmackeyid];
+			rcu_read_lock();
+			hinfo = rcu_dereference(sdata->hmac_table[hmackeyid]);
 			key = hinfo ? hinfo->secret : seg6_hmac_key;
 			keylen = hinfo ? hinfo->slen : strlen(seg6_hmac_key);
 
 			memset(SEG6_HMAC(sr_phdr), 0, 32);
 			sr_hmac_sha1(key, keylen, sr_phdr, saddr,
 				     (u32 *)SEG6_HMAC(sr_phdr));
+			rcu_read_unlock();
 		}
 
 		sr_phdr->nexthdr = *proto;
